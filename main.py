@@ -1,6 +1,6 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour.
 
-Entry for make.fun competition gta6-twitch-ccu-forecast-01.
+Entry for make.fun competition gta6-twitch-ccu-forecast-01 (round 2).
 
 The program reads one case file (schema "makefun/twitch-ccu-case/v1") and
 writes, for each of hours 2..24 of the release day, five quantiles of that
@@ -15,38 +15,55 @@ unlocks, not by the game: New Zealand first, then Europe, the UK at 00:00Z,
 the US east coast at 05:00Z and the west coast at 08:00Z. So past launches
 with the same rolling-midnight unlock have the same intraday shape, once
 each is rescaled by its own hour-1 print. The forecast is therefore built
-from the case's own `comparables`:
+from the case's own `comparables`, as an ensemble of four forecasters that
+each see the same pool differently (their geometric mean is the entry):
 
-1.  Keep only usable past launches: tier "comparable" (no early-access
-    contamination, no weak/F2P analogue), no simultaneous global unlock,
-    and an hour-1 print of at least 5,000 viewers (below that, the print
-    is noise from the unlock hour, not a scale).
-2.  Split the pool in two by how the target's hour-1 print compares with
-    its own pre-release level: x = hour1 / mean(viewers in the 6 hours
-    before the release day). Launches whose hour 1 was small next to
-    their pre-release evening (x < 0.6) surge much harder through the
-    day than launches whose hour 1 was already large. The split is a
-    hard threshold with a minimum group size, so a target far outside
-    the observed range simply lands in the high group instead of being
-    extrapolated.
-3.  For each hour h, take the log-ratios ln(v_h / v_1) of the games in
-    the target's group, and set the forecast's centre to their mean and
-    its log-spread to their (sample) standard deviation, floored at
-    0.12. Quantiles are q_tau = hour1 * exp(centre + z_tau * spread),
-    with z the standard normal quantiles. The spread is honest: it is
-    the disagreement between real past launches, not an assumed number.
+1.  **Split-group normal (calibrated).** Keep only usable past launches:
+    tier "comparable" (no early-access contamination, no weak/F2P
+    analogue), no simultaneous global unlock, and an hour-1 print of at
+    least 5,000 viewers. Split the pool in two by how each launch's hour-1
+    print compares with its own pre-release level (x = hour1 / mean
+    viewers in the 6 hours before the release day, threshold 0.6, minimum
+    group size 4): launches whose hour 1 was small next to their
+    pre-release evening surge much harder through the day. Per hour, the
+    centre is the mean of ln(v_h / v_1) in the target's group and the
+    spread its sample standard deviation (floored at 0.12), both lightly
+    smoothed across neighbouring hours, and the spread is scaled by 0.85
+    (the raw spread is slightly too wide for pinball loss on the log
+    scale). Quantiles are q_tau = hour1 * exp(centre + z_tau * spread).
+2.  **Two-feature regression.** Per hour, an ordinary least squares fit
+    of ln(v_h / v_1) on ln(x) and ln(hour1) over the whole usable pool,
+    evaluated at the target's own x and hour-1 print (both clamped to the
+    pool's observed range, so an out-of-range target never extrapolates
+    wildly), with the residual standard deviation as the spread. This
+    lets the shape move continuously with the target instead of jumping
+    at the split threshold.
+3.  **Empirical quantiles.** The same split group as (1), but the five
+    quantiles are the empirical quantiles of the group's log-ratios,
+    shrunk halfway toward the normal quantiles of (1): the empirical
+    shape keeps the real skew of past launches, the shrinkage keeps the
+    small-group quantiles from jumping around.
+4.  **Trimmed-mean normal.** As (1) with the centre a 20% trimmed mean
+    of the group's log-ratios and spread scaled by 0.85, so one extreme
+    past launch cannot drag an hour's centre.
 
-If anything unexpected happens (no usable pool, missing history, a
-malformed field) the program falls back to a plain persistence forecast
-so the case still gets a valid output instead of crashing.
+The four forecasts are combined by geometric mean of their quantiles
+(mean in log space), which is what an ensemble of log-scale forecasters
+should average. If anything unexpected happens (no usable pool, missing
+history, a malformed field) the program falls back to a plain
+persistence forecast so the case still gets a valid output instead of
+crashing.
 
 ## Local practice result
 
 Scored against the four practice launches' real SullyGnome hourly
 counts (Marvel's Wolverine, Red Dead Redemption 2, God of War
 Ragnarok, Marvel's Spider-Man 2), this entry scores a mean pinball
-loss of 0.172, against 0.387 for the house baseline, with
-90% coverage of 0.89. See README.md for the per-case table.
+loss of 0.167, against 0.387 for the house baseline and 0.172 for the
+round-1 entry, with 90% coverage of 0.89. Leave-one-out over the 14
+usable comparables (each past launch forecast from the other 13):
+0.249, against 0.251 for round 1. See README.md for the per-case
+table and the three variants that were compared.
 """
 
 import json
@@ -79,6 +96,14 @@ SD_FLOOR = 0.12
 # Fallback persistence spread (log units per sqrt hour), used only when
 # the comparable pool is unusable.
 FALLBACK_SIGMA = 0.15
+# Ensemble calibration, tuned on the practice cases and on
+# leave-one-out over the comparable pool (see module docstring):
+# spread scale for the normal components, smoothing weight for a
+# neighbouring hour's centre/spread, empirical shrinkage, trim share.
+SPREAD_MULT = 0.85
+SMOOTH_W = 0.25
+EMP_SHRINK = 0.5
+TRIM_SHARE = 0.2
 
 
 def parse_time(text):
@@ -190,6 +215,25 @@ def target_pre_level(case):
     return pre_release_level(rows, parse_time(case["day_start"]))
 
 
+def pool_entries(pool):
+    """Pool entries with their own hour1 / pre-release ratio x."""
+    return [
+        {"curve": entry["curve"], "pre6": entry["pre6"],
+         "x": entry["curve"][1] / entry["pre6"]}
+        for entry in pool
+    ]
+
+
+def split_group(entries, x_target):
+    """The target's half of the pool by the x = hour1 / pre-level split."""
+    low = [e for e in entries if e["x"] < SPLIT_X]
+    high = [e for e in entries if e["x"] >= SPLIT_X]
+    chosen = low if x_target < SPLIT_X else high
+    if len(chosen) < MIN_GROUP:
+        chosen = entries
+    return chosen
+
+
 def mean_and_sd(values):
     """Mean and sample standard deviation of a list of floats."""
     n = len(values)
@@ -200,27 +244,155 @@ def mean_and_sd(values):
     return mean, max(math.sqrt(variance), SD_FLOOR)
 
 
-def hour_quantiles(hour1, pool, hour):
-    """The five quantiles for one hour from the pool's log-ratios."""
-    log_ratios = []
-    for curve in pool:
-        if hour in curve and curve[hour] > 0:
-            log_ratios.append(math.log(curve[hour] / curve[1]))
-    if not log_ratios:
-        log_ratios = [0.0]
-    centre, spread = mean_and_sd(log_ratios)
+def trimmed_mean(values):
+    """Mean after trimming TRIM_SHARE from each tail (at least 1 value)."""
+    ordered = sorted(values)
+    k = int(len(ordered) * TRIM_SHARE)
+    if len(ordered) - 2 * k >= 3:
+        ordered = ordered[k:len(ordered) - k] if k else ordered
+    return sum(ordered) / len(ordered)
+
+
+def smooth_series(series, hours):
+    """Light 3-point smoothing of a per-hour series (weight SMOOTH_W)."""
+    out = {}
+    for hour in hours:
+        total = 0.0
+        weight = 0.0
+        for delta, w in ((-1, SMOOTH_W), (0, 1.0), (1, SMOOTH_W)):
+            if hour + delta in series:
+                total += w * series[hour + delta]
+                weight += w
+        out[hour] = total / weight
+    return out
+
+
+def finish_quantiles(log_values):
+    """Turn five log-quantiles into rounded, non-decreasing viewer counts."""
     quantiles = []
     previous = 0.0
-    for z in Z:
-        value = hour1 * math.exp(centre + z * spread)
-        value = min(max(value, 1.0), 1e9)
+    for value in log_values:
+        value = min(max(math.exp(value), 1.0), 1e9)
         value = round2_half_up(value)
-        # Rounding can only tie neighbours, never reverse them; the
-        # running max keeps the row non-decreasing in every case.
         value = max(value, previous)
         previous = value
         quantiles.append(value)
     return quantiles
+
+
+def normal_component(entries, hour1, x_target, trimmed, spread_mult, smooth):
+    """Split-group normal quantiles; optionally trimmed centre / smoothed."""
+    chosen = split_group(entries, x_target)
+    hours = list(range(2, 25))
+    centres = {}
+    spreads = {}
+    for hour in hours:
+        ratios = [math.log(e["curve"][hour] / e["curve"][1]) for e in chosen]
+        centre, spread = mean_and_sd(ratios)
+        if trimmed:
+            centre = trimmed_mean(ratios)
+        centres[hour] = centre
+        spreads[hour] = spread
+    if smooth:
+        centres = smooth_series(centres, hours)
+        spreads = smooth_series(spreads, hours)
+    log_hour1 = math.log(hour1)
+    return {"hours": [
+        {"hour": hour, "q": finish_quantiles([
+            log_hour1 + centres[hour] + z * spreads[hour] * spread_mult
+            for z in Z])}
+        for hour in hours]}
+
+
+def empirical_component(entries, hour1, x_target):
+    """Split-group empirical quantiles, shrunk toward the normal ones."""
+    chosen = split_group(entries, x_target)
+    hours = list(range(2, 25))
+    log_hour1 = math.log(hour1)
+    rows = []
+    for hour in hours:
+        ratios = sorted(
+            math.log(e["curve"][hour] / e["curve"][1]) for e in chosen)
+        centre, spread = mean_and_sd(ratios)
+        quantiles = []
+        for tau, z in zip(LEVELS, Z):
+            pos = tau * (len(ratios) - 1)
+            low = int(math.floor(pos))
+            high = min(low + 1, len(ratios) - 1)
+            frac = pos - low
+            empirical = ratios[low] * (1 - frac) + ratios[high] * frac
+            normal = centre + z * spread
+            value = (1 - EMP_SHRINK) * empirical + EMP_SHRINK * normal
+            quantiles.append(log_hour1 + value)
+        rows.append({"hour": hour, "q": finish_quantiles(quantiles)})
+    return {"hours": rows}
+
+
+def _solve_3x3(matrix, rhs):
+    """Solve a 3x3 linear system by Gaussian elimination (or None)."""
+    rows = [row[:] + [b] for row, b in zip(matrix, rhs)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda r: abs(rows[r][col]))
+        if abs(rows[pivot][col]) < 1e-12:
+            return None
+        rows[col], rows[pivot] = rows[pivot], rows[col]
+        for r in range(3):
+            if r != col:
+                factor = rows[r][col] / rows[col][col]
+                for c in range(col, 4):
+                    rows[r][c] -= factor * rows[col][c]
+    return [rows[i][3] / rows[i][i] for i in range(3)]
+
+
+def regression_component(entries, hour1, x_target):
+    """Per-hour OLS of ln(v_h / v_1) on ln(x) and ln(hour1), whole pool.
+
+    The target's features are clamped to the pool's observed range so an
+    out-of-range target (a much bigger launch than any comparable) never
+    extrapolates wildly; it lands on the nearest edge instead.
+    """
+    if len(entries) < 5:
+        return None
+    log_x = [math.log(e["x"]) for e in entries]
+    log_h1 = [math.log(e["curve"][1]) for e in entries]
+    lx_target = min(max(math.log(max(x_target, 1e-6)), min(log_x)), max(log_x))
+    lh_target = min(max(math.log(hour1), min(log_h1)), max(log_h1))
+    rows = []
+    for hour in range(2, 25):
+        design = [[1.0, lx, lh] for lx, lh in zip(log_x, log_h1)]
+        target = [math.log(e["curve"][hour] / e["curve"][1]) for e in entries]
+        normal = [[sum(design[k][i] * design[k][j] for k in range(len(design)))
+                   + (1e-6 if i == j and i > 0 else 0.0)
+                   for j in range(3)] for i in range(3)]
+        rhs = [sum(design[k][i] * target[k] for k in range(len(design)))
+               for i in range(3)]
+        beta = _solve_3x3(normal, rhs)
+        if beta is None:
+            return None
+        centre = beta[0] + beta[1] * lx_target + beta[2] * lh_target
+        residuals = [target[k] - (beta[0] + beta[1] * design[k][1]
+                                  + beta[2] * design[k][2])
+                     for k in range(len(design))]
+        dof = max(len(design) - 3, 1)
+        spread = max(math.sqrt(sum(r * r for r in residuals) / dof), SD_FLOOR)
+        log_hour1 = math.log(hour1)
+        rows.append({"hour": hour, "q": finish_quantiles([
+            log_hour1 + centre + z * spread for z in Z])})
+    return {"hours": rows}
+
+
+def ensemble(forecasts):
+    """Geometric mean of the component forecasts' quantiles, per hour."""
+    rows = []
+    for i in range(23):
+        quantiles = []
+        for j in range(5):
+            log_mean = sum(
+                math.log(f["hours"][i]["q"][j]) for f in forecasts) / len(forecasts)
+            quantiles.append(log_mean)
+        rows.append({"hour": forecasts[0]["hours"][i]["hour"],
+                     "q": finish_quantiles(quantiles)})
+    return {"hours": rows}
 
 
 def persistence_quantiles(hour1, hour):
@@ -256,23 +428,30 @@ def forecast_case(case):
     except Exception:
         pool = []
     if pool:
-        # Split the pool by the target's own hour-1 print against its
-        # pre-release level: a launch whose hour 1 was small next to
-        # its pre-release evening surges much harder through the day.
-        # A group smaller than MIN_GROUP is not trusted on its own.
-        curves = [entry["curve"] for entry in pool]
-        level = target_pre_level(case)
-        if level and level > 0:
-            x = hour1 / level
-            low = [e["curve"] for e in pool if e["curve"][1] / e["pre6"] < SPLIT_X]
-            high = [e["curve"] for e in pool if e["curve"][1] / e["pre6"] >= SPLIT_X]
-            chosen = low if x < SPLIT_X else high
-            if len(chosen) >= MIN_GROUP:
-                curves = chosen
-        return {"hours": [
-            {"hour": hour, "q": hour_quantiles(hour1, curves, hour)}
-            for hour in hours_to_forecast
-        ]}
+        try:
+            entries = pool_entries(pool)
+            level = target_pre_level(case)
+            x_target = hour1 / level if level and level > 0 else 0.7
+            components = []
+            components.append(normal_component(
+                entries, hour1, x_target, trimmed=False,
+                spread_mult=SPREAD_MULT, smooth=True))
+            components.append(normal_component(
+                entries, hour1, x_target, trimmed=True,
+                spread_mult=SPREAD_MULT, smooth=False))
+            components.append(empirical_component(entries, hour1, x_target))
+            regression = regression_component(entries, hour1, x_target)
+            if regression is not None:
+                components.append(regression)
+            if len(components) >= 2:
+                combined = ensemble(components)
+                # Keep only the hours the case actually asks for.
+                wanted = set(hours_to_forecast)
+                combined["hours"] = [row for row in combined["hours"]
+                                     if row["hour"] in wanted]
+                return combined
+        except Exception:
+            pass
     return {"hours": [
         {"hour": hour, "q": persistence_quantiles(hour1, hour)}
         for hour in hours_to_forecast
