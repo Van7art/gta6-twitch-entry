@@ -62,8 +62,11 @@ Ragnarok, Marvel's Spider-Man 2), this entry scores a mean pinball
 loss of 0.167, against 0.387 for the house baseline and 0.172 for the
 round-1 entry, with 90% coverage of 0.89. Leave-one-out over the 14
 usable comparables (each past launch forecast from the other 13):
-0.249, against 0.251 for round 1. See README.md for the per-case
-table and the three variants that were compared.
+0.249, against 0.251 for round 1. In the final case the pool grows:
+the final's comparables include all four practice launches as well,
+so the split groups are larger there than on the practice. See
+README.md for the per-case table and the three variants that were
+compared.
 """
 
 import json
@@ -382,7 +385,14 @@ def regression_component(entries, hour1, x_target):
 
 
 def ensemble(forecasts):
-    """Geometric mean of the component forecasts' quantiles, per hour."""
+    """Geometric mean of the component forecasts' quantiles, per hour.
+
+    Averaging in log space is the right combination for log-scale
+    quantiles: it keeps the ensemble's median between the components'
+    medians and its spread between their spreads, instead of letting
+    one wide component dominate the tails the way an arithmetic mean
+    of viewer counts would.
+    """
     rows = []
     for i in range(23):
         quantiles = []
